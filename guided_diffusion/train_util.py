@@ -53,7 +53,7 @@ class TrainLoop:
         lr_anneal_steps=0,
     ):
         self.model = model
-        self.dataloader=dataloader
+        self.dataloader = dataloader
         self.classifier = classifier
         self.diffusion = diffusion
         self.data = data
@@ -76,9 +76,10 @@ class TrainLoop:
 
         self.step = 0
         self.resume_step = 0
-        self.global_batch = self.batch_size * dist.get_world_size()
+        self.global_batch = self.batch_size  # No need for dist.get_world_size()
 
-        self.sync_cuda = th.cuda.is_available()
+        # Sync CUDA removed
+        self.sync_cuda = False
 
         self._load_and_sync_parameters()
         self.mp_trainer = MixedPrecisionTrainer(
@@ -92,8 +93,6 @@ class TrainLoop:
         )
         if self.resume_step:
             self._load_optimizer_state()
-            # Model was resumed, either due to a restart or a checkpoint
-            # being specified at the command line.
             self.ema_params = [
                 self._load_ema_parameters(rate) for rate in self.ema_rate
             ]
@@ -103,24 +102,11 @@ class TrainLoop:
                 for _ in range(len(self.ema_rate))
             ]
 
-        if th.cuda.is_available():
-            self.use_ddp = True
-            self.ddp_model = DDP(
-                self.model,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
-        else:
-            if dist.get_world_size() > 1:
-                logger.warn(
-                    "Distributed training requires CUDA. "
-                    "Gradients will not be synchronized properly!"
-                )
-            self.use_ddp = False
-            self.ddp_model = self.model
+        # Use the model directly without DDP
+        self.use_ddp = False
+        self.ddp_model = self.model  # Model without DDP wrapping
+
+    # Other methods unchanged
 
     def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
@@ -213,17 +199,18 @@ class TrainLoop:
         return sample
 
     def forward_backward(self, batch, cond):
-
         self.mp_trainer.zero_grad()
+
+        # Ensure batch is moved to CPU
         for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to(dist_util.dev())
+            micro = batch[i : i + self.microbatch].to('cpu')  # Move to CPU explicitly
             micro_cond = {
-                k: v[i : i + self.microbatch].to(dist_util.dev())
+                k: v[i : i + self.microbatch].to('cpu')  # Move conditionals to CPU
                 for k, v in cond.items()
             }
 
             last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+            t, weights = self.schedule_sampler.sample(micro.shape[0], 'cpu')  # Sample on CPU
 
             compute_losses = functools.partial(
                 self.diffusion.training_losses_segmentation,
@@ -234,17 +221,13 @@ class TrainLoop:
                 model_kwargs=micro_cond,
             )
 
-            if last_batch or not self.use_ddp:
-                losses1 = compute_losses()
-
-            else:
-                with self.ddp_model.no_sync():
-                    losses1 = compute_losses()
+            losses1 = compute_losses()
 
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(
-                    t, losses["loss"].detach()
+                    t, losses1[0]["loss"].detach()
                 )
+
             losses = losses1[0]
             sample = losses1[1]
 
@@ -253,11 +236,10 @@ class TrainLoop:
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
-            self.mp_trainer.backward(loss)
-            for name, param in self.ddp_model.named_parameters():
-                if param.grad is None:
-                    print(name)
-            return  sample
+            self.mp_trainer.backward(loss)  # Backpropagate on CPU
+
+        return sample
+
 
     def _update_ema(self):
         for rate, params in zip(self.ema_rate, self.ema_params):

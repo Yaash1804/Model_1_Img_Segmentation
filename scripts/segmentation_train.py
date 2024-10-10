@@ -1,6 +1,6 @@
-
 import sys
 import argparse
+import socket
 sys.path.append("..")
 sys.path.append(".")
 from guided_diffusion import dist_util, logger
@@ -15,34 +15,45 @@ from guided_diffusion.script_util import (
 )
 import torch as th
 from guided_diffusion.train_util import TrainLoop
-from visdom import Visdom
-viz = Visdom(port=8850)
 import torchvision.transforms as transforms
+
+# Attempt to connect to Visdom
+def try_connect_visdom(port=8850):
+    try:
+        viz = Visdom(port=port)
+        if not viz.check_connection():
+            raise ConnectionError
+        return viz
+    except Exception:
+        print(f"Warning: Could not connect to Visdom server at port {port}. Continuing without visualization.")
+        return None
 
 def main():
     args = create_argparser().parse_args()
 
     dist_util.setup_dist(args)
-    logger.configure(dir = args.out_dir)
+    logger.configure(dir=args.out_dir)
 
     logger.log("creating data loader...")
 
     if args.data_name == 'ISIC':
-        tran_list = [transforms.Resize((args.image_size,args.image_size)), transforms.ToTensor(),]
+        tran_list = [transforms.Resize((args.image_size, args.image_size)), transforms.ToTensor()]
         transform_train = transforms.Compose(tran_list)
 
         ds = ISICDataset(args, args.data_dir, transform_train)
         args.in_ch = 4
     elif args.data_name == 'BRATS':
-        tran_list = [transforms.Resize((args.image_size,args.image_size)),]
+        tran_list = [transforms.Resize((args.image_size, args.image_size))]
         transform_train = transforms.Compose(tran_list)
 
         ds = BRATSDataset3D(args.data_dir, transform_train, test_flag=False)
         args.in_ch = 5
-    datal= th.utils.data.DataLoader(
+
+    datal = th.utils.data.DataLoader(
         ds,
         batch_size=args.batch_size,
-        shuffle=True)
+        shuffle=True
+    )
     data = iter(datal)
 
     logger.log("creating model and diffusion...")
@@ -50,13 +61,19 @@ def main():
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
+    
+    # Set up multi-GPU or single GPU
     if args.multi_gpu:
-        model = th.nn.DataParallel(model,device_ids=[int(id) for id in args.multi_gpu.split(',')])
-        model.to(device = th.device('cuda', int(args.gpu_dev)))
+        model = th.nn.DataParallel(model, device_ids=[int(id) for id in args.multi_gpu.split(',')])
+        model.to(device=th.device('cuda', int(args.gpu_dev)))
     else:
+        # Use "gloo" if only CPU or single GPU is available
         model.to(dist_util.dev())
-    schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion,  maxt=args.diffusion_steps)
 
+    schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion, maxt=args.diffusion_steps)
+
+    # Attempt to connect to Visdom
+    viz = try_connect_visdom(port=8850)
 
     logger.log("training...")
     TrainLoop(
@@ -79,10 +96,9 @@ def main():
         lr_anneal_steps=args.lr_anneal_steps,
     ).run_loop()
 
-
 def create_argparser():
     defaults = dict(
-        data_name = 'BRATS',
+        data_name='BRATS',
         data_dir="../dataset/brats2020/training",
         schedule_sampler="uniform",
         lr=1e-4,
@@ -93,12 +109,12 @@ def create_argparser():
         ema_rate="0.9999",  # comma-separated list of EMA values
         log_interval=100,
         save_interval=5000,
-        resume_checkpoint='',#'"./results/pretrainedmodel.pt",
+        resume_checkpoint='',  # Path to a pretrained model, if any
         use_fp16=False,
         fp16_scale_growth=1e-3,
-        gpu_dev = "0",
-        multi_gpu = None, #"0,1,2"
-        out_dir='./results/'
+        gpu_dev="0",
+        multi_gpu=None,  # Comma-separated GPU IDs if multi-GPU is used
+        out_dir='./results/',
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

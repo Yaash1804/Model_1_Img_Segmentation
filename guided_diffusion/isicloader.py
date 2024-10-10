@@ -51,6 +51,6 @@ class ISICDataset(Dataset):
             mask = self.transform(mask)
 
         if self.mode == 'Training':
-            return (img, mask)
+            return (img, mask,name)
         else:
             return (img, mask, name)
